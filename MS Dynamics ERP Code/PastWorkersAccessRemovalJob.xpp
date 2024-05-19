@@ -1,0 +1,170 @@
+/*
+    Author: Shresth Mishra
+
+    Description:
+    This X++ class implements a job to process past workers in the system and remove their access rights.
+    It collects information about past workers' enabled user accounts, user accounts with multiple security roles,
+    and user accounts that are members of user groups. It then iterates through past workers, disabling their
+    user accounts, removing their security roles (except for the System User role), and removing them from user groups
+    as necessary.
+
+    The class also logs the actions taken for each past worker into a custom result table for auditing purposes.
+
+    Class Name: PastWorkersAccessRemovalJob
+
+    Methodology:
+    1. Define necessary variables and query to retrieve past workers.
+    2. Find the System User Security Role.
+    3. Collect information about enabled user accounts, user accounts with multiple security roles, and user accounts in user groups.
+    4. Process each past worker:
+        a. Disable user account if enabled.
+        b. Remove security roles (except System User role) if multiple roles exist.
+        c. Remove from user groups if a member.
+        d. Log actions taken for auditing.
+    5. Output processing result.
+
+    Usage:
+    - Run this job periodically to maintain system security by removing access rights of past workers.
+
+    Note: Modify the code as per specific business requirements and security policies.
+
+*/
+
+class PastWorkersAccessRemovalJob
+{
+    // Main method to execute the job
+    public static void Main(Args args)
+    {
+        // Author: Shresth Mishra
+
+        // Variable declarations
+        SecurityRole     systemUserSecurityRole;
+        SecurityUserRole securityUserRole;
+        UserInfo         userInfo;
+        UserGroupList    userGroupList, userGroupListDel;
+
+        // Query to retrieve past workers
+        Query pastWorkersQuery = new Query(QueryStr(HcmWorkerListPage_PastWorkers));
+
+        // Define data sources and join conditions for past workers
+        QueryBuildDataSource spkWorkerDataSource = pastWorkersQuery.dataSourceTable(tableNum(HcmWorker)).addDataSource(tableNum(SPKHcmWorker));
+        spkWorkerDataSource.addLink(fieldnum(HcmWorker, RecId), fieldnum(SPKHcmWorker, WorkerRefRecId));
+        spkWorkerDataSource.joinMode(JoinMode::InnerJoin); // Inner join between HcmWorker and SPKHcmWorker
+        spkWorkerDataSource.relations(false); // Disable relations
+        spkWorkerDataSource.fetchmode(QueryFetchMode::One2One); // Fetch mode set to One2One for direct mapping
+
+        // Step 1: Find the System User Security Role
+        //systemUserSecurityRole = SecurityRole::find("SystemUser");
+
+        select firstonly systemUserSecurityRole
+            where systemUserSecurityRole.AotName == "SystemUser";
+
+        // If System User Security Role not found, display error message and exit
+        if (!systemUserSecurityRole)
+        {
+            error("System User Security Role not found.");
+            return;
+        }
+
+        // Step 2: Collect Enabled User Accounts
+        Set userInfoSet = new Set(Types::String);
+
+        while select Id
+            from userInfo
+            where userinfo.enable == NoYes::Yes
+        {
+            userInfoSet.add(userInfo.Id);
+        }
+
+        // Step 3: Collect User Accounts with Multiple Security Roles
+        Set secUserRoleSet = new Set(Types::String);
+
+        while select User, count(RecId) from securityUserRole
+            group by User
+            where securityUserRole.RecId > 1
+        {
+            secUserRoleSet.add(securityUserRole.User);
+        }
+
+        // Step 4: Collect User Accounts that are Members of User Groups
+        Set userGroupSet = new Set(Types::String);
+
+        while select UserId, count(RecId) from userGroupList
+            group by UserId
+        {
+            userGroupSet.add(userGroupList.UserId);
+        }
+
+        int processedRecords = 0;
+
+        // Create a reference to the custom result table for logging actions taken
+        YourCustomResultTable resultTable;
+
+        // Step 5: Process Past Workers
+        QueryRun queryRun = new QueryRun(pastWorkersQuery);
+
+        while (queryRun.next())
+        {
+            SPKHcmWorker worker = queryRun.Get(tableNum(SPKHcmWorker));
+
+            // Check if the user account is enabled and should be disabled.
+            boolean disableUser = userInfoSet.in(worker.TNumber);
+
+            // Check if the user account has multiple security roles.
+            boolean removeSecurityRoles = secUserRoleSet.in(worker.TNumber);
+
+            // Check if the user account is a member of any user groups.
+            boolean removeFromUserGroups = userGroupSet.in(worker.TNumber);
+
+            if (disableUser || removeSecurityRoles || removeFromUserGroups)
+            {
+                if (disableUser)
+                {
+                    update_recordset userInfo
+                        setting enable = NoYes::No
+                        where userInfo.Id == worker.TNumber;
+
+                    // Log action: Disabled user account
+                    resultTable.TNumber = worker.TNumber;
+                    resultTable.ActionTaken = "Disabled";
+                    resultTable.insert();
+                }
+
+                if (removeSecurityRoles)
+                {
+                    delete_from securityUserRole
+                        where securityUserRole.User == worker.TNumber
+                        && securityUserRole.SecurityRole != systemUserSecurityRole.RecId;
+
+                    // Log action: Removed security roles
+                    resultTable.TNumber = worker.TNumber;
+                    resultTable.ActionTaken = "Removed Security Roles";
+                    resultTable.insert();
+                }
+
+                if (removeFromUserGroups)
+                {
+                    delete_from userGroupList
+                        where userGroupList.UserId == worker.TNumber;
+
+                    // Log action: Removed from user groups
+                    resultTable.TNumber = worker.TNumber;
+                    resultTable.ActionTaken = "Removed from User Groups";
+                    resultTable.insert();
+                }
+
+                processedRecords++;
+            }
+        }
+
+        // Step 6: Output Processing Result
+        if (processedRecords == 1)
+        {
+            info(strFmt("@SPK:PastWorkersAccessRemovalProcessedRecord", processedRecords));
+        }
+        else
+        {
+            info(strFmt("@SPK:PastWorkersAccessRemovalProcessedRecords", processedRecords));
+        }
+    }
+}
